@@ -32,7 +32,7 @@ def circle_points(p1, p2, p3, num=72):
     return pts, s
 
 
-def tool_orientation(n, approach='normal'):
+def tool_orientation(n):
     """Матрица ориентации инструмента: ось z инструмента направлена против нормали плоскости (к «бумаге»)."""
     z = -np.asarray(n, dtype=float)
     ref = np.array([1.0, 0.0, 0.0]) if abs(z[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
