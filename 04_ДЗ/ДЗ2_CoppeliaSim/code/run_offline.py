@@ -56,7 +56,10 @@ def main():
     fk = np.array([robot.forward(qk).t_3_1.ravel() for qk in Q])
     err = np.linalg.norm(fk - pts, axis=1)
     jump = np.abs(np.diff(Q, axis=0)).max()
-    smin = [np.linalg.svd(robot.forward(qk) and robot.jacobian, compute_uv=False).min() for qk in Q]
+    smin = []
+    for qk in Q:
+        robot.forward(qk)                                   # якобиан считается для текущей конфигурации
+        smin.append(np.linalg.svd(robot.jacobian, compute_uv=False).min())
     print('ошибка положения: макс. %.2e м; наибольший скачок координаты между соседними точками %.1f°; мин. сингулярное число J: %.3f' % (err.max(), np.degrees(jump), min(smin)))
 
     np.savetxt(os.path.join(HERE, 'trajectory.csv'), np.column_stack([s, Q]), delimiter=',', header='s,' + ','.join('q%d' % (i + 1) for i in range(robot.num_axis)), comments='')

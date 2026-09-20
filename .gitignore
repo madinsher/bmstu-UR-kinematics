@@ -19,6 +19,7 @@ __pycache__/
 # результаты прогонов у каждого свои
 trajectory.csv
 tip_trace.csv
+04_ДЗ/ДЗ2_CoppeliaSim/code/offline_check.png
 *.log
 
 # временные файлы Office и Яндекс.Диска
