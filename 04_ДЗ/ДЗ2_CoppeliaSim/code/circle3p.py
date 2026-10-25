@@ -4,7 +4,7 @@ import numpy as np
 
 
 def circle_through_points(p1, p2, p3, tol=1e-9):
-    """Центр C, радиус R, орты плоскости u, w и нормаль n окружности через три точки.
+    """Центр C, радиус rho (ρ), орты плоскости u, w и нормаль n окружности через три точки.
     ValueError, если точки лежат на одной прямой."""
     p1, p2, p3 = (np.asarray(p, dtype=float) for p in (p1, p2, p3))
     a, b = p2 - p1, p3 - p1
@@ -44,6 +44,6 @@ def tool_orientation(n):
 if __name__ == '__main__':
     P = [(0.6, -0.2, 0.5), (0.8, 0.0, 0.7), (0.6, 0.2, 0.5)]
     c, r, u, w, n = circle_through_points(*P)
-    print('C =', c.round(4), ' R = %.4f' % r, ' n =', n.round(4))
+    print('C =', c.round(4), ' rho = %.4f' % r, ' n =', n.round(4))
     for p in P:
         print('  расстояние от C до точки: %.6f, отклонение от плоскости: %.1e' % (np.linalg.norm(np.array(p) - c), abs((np.array(p) - c) @ n)))

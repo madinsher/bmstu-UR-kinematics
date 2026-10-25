@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""kinlib — учебная библиотека кинематики манипуляторов для демонстраций на занятиях 2–3.
+"""kinlib — учебная библиотека кинематики манипуляторов для демонстраций на занятиях 1–4.
 
 Основа — классы Frame / Robot / RobotSerial / RobotTrajectory из ноутбука
 «ПЗК_и_ОЗК_на_Python.ipynb» (визуализация на matplotlib, без внешних робототехнических
@@ -8,8 +8,22 @@
 
 Обозначения по учебнику Зенкевича — Ющенко: q — обобщённые координаты, A_i — матрицы
 Денавита — Хартенберга, T_i = A_1…A_i, J — матрица Якоби.
-ВНИМАНИЕ: в классе RobotSerial якобиан хранится в порядке [v; ω] (сначала линейная,
-затем угловая скорость), а в книге — [ω; v]. См. функцию jacobian_book().
+
+СОГЛАШЕНИЕ О ПОРЯДКЕ БЛОКОВ. В лекциях и в учебнике обобщённая скорость тела записывается
+как (ω; v) — сначала угловая, затем линейная. Метод RobotSerial.jacobian (и метод
+pose_error) по историческим причинам и так же, как у Siciliano и в Robotics Toolbox
+(Corke), возвращает порядок [v; ω]. Порядок учебника дают jacobian_book() и
+pose_error(..., order='wv').
+
+Модели роботов:
+  make_ur5e() — UR5e по официальной таблице ДХ Universal Robots (сквозной пример курса);
+  make_puma() — PUMA 560 с параметрами Robotics Toolbox (пример учебника);
+  make_ur()   — «учебный 6R» (прежняя таблица UR_DH, не совпадает ни с одной моделью UR;
+                оставлен для уже существующих примеров).
+
+Переименования (старые имена работают как псевдонимы):
+  Frame.euler_3 / from_euler_3 -> Frame.rpy_zyx / from_rpy_zyx (углы ZYX: рыскание, тангаж, крен);
+  RobotSerial.dls_lambda -> RobotSerial.dls_mu (коэффициент демпфирования μ).
 """
 import logging
 from abc import abstractmethod
@@ -74,8 +88,24 @@ class Frame:
         return Rotation.from_matrix(self.r_3_3).as_rotvec()
 
     @property
-    def euler_3(self):
+    def rpy_zyx(self):
+        """Углы 3-2-1 (ZYX) в порядке (ψ, θ, φ): рыскание, тангаж, крен, рад.
+        R = Rz(ψ)·Ry(θ)·Rx(φ) — последовательные повороты вокруг новых осей z, y, x
+        (то же самое, что повороты вокруг неподвижных осей x, y, z в обратном порядке).
+        Вырождение — при θ = ±90° (тангаж). Это НЕ углы Эйлера ZYZ (их даёт euler_zyz)."""
         return Rotation.from_matrix(self.r_3_3).as_euler("ZYX", degrees=False)
+
+    @property
+    def euler_3(self):
+        """Устаревшее имя rpy_zyx: возвращает углы ZYX (ψ, θ, φ), а не углы Эйлера ZYZ."""
+        return self.rpy_zyx
+
+    @property
+    def euler_zyz(self):
+        """Углы Эйлера ZYZ (φ, θ, ψ), рад: R = Rz(φ)·Ry(θ)·Rz(ψ) (лекция 1).
+        θ ∈ [0, π]; вырождение при sin θ = 0 (θ = 0 и θ = π) — тогда φ и ψ по отдельности
+        не определены и scipy выдаёт предупреждение, полагая одну из них нулём."""
+        return Rotation.from_matrix(self.r_3_3).as_euler("ZYZ", degrees=False)
 
     @staticmethod
     def from_r_3_3(r_3_3, t_3_1):
@@ -93,8 +123,19 @@ class Frame:
         return Frame.from_r_3_3(Rotation.from_rotvec(r_3).as_matrix(), t_3_1)
 
     @staticmethod
+    def from_rpy_zyx(angles, t_3_1):
+        """Положение по углам ZYX (ψ, θ, φ): R = Rz(ψ)·Ry(θ)·Rx(φ)."""
+        return Frame.from_r_3_3(Rotation.from_euler("ZYX", angles, degrees=False).as_matrix(), t_3_1)
+
+    @staticmethod
     def from_euler_3(euler_3, t_3_1):
-        return Frame.from_r_3_3(Rotation.from_euler("ZYX", euler_3, degrees=False).as_matrix(), t_3_1)
+        """Устаревшее имя from_rpy_zyx (углы ZYX, а не ZYZ)."""
+        return Frame.from_rpy_zyx(euler_3, t_3_1)
+
+    @staticmethod
+    def from_euler_zyz(angles, t_3_1):
+        """Положение по углам Эйлера ZYZ (φ, θ, ψ): R = Rz(φ)·Ry(θ)·Rz(ψ)."""
+        return Frame.from_r_3_3(Rotation.from_euler("ZYZ", angles, degrees=False).as_matrix(), t_3_1)
 
     @staticmethod
     def from_dh(dh_params):
@@ -237,12 +278,22 @@ def simplify_angles(angles):
 
 # ============================================================== RobotSerial
 class RobotSerial(Robot):
-    """Разомкнутая цепь по таблице ДХ dh_params [n,4] = | d | a | alpha | theta0 |."""
+    """Разомкнутая цепь по таблице ДХ dh_params [n,4] = | d | a | alpha | theta0 |.
+
+    Параметры итерационной ОЗК (inverse_numerical):
+      inv_m      — 'jac_pinv' (J⁺, метод Ньютона), 'jac_dls' (демпфированная J⁺) или 'jac_t' (Jᵀ);
+      step_size  — начальный шаг α; по умолчанию 1.0 (полный шаг Ньютона);
+      line_search — True: шаг уменьшается вдвое, пока невязка не уменьшится (backtracking);
+      tol_pos, tol_rot — допуски по положению, м, и по ориентации, рад; по умолчанию оба
+                   равны final_loss (прежний единый допуск, оставлен для совместимости);
+      dls_mu     — коэффициент демпфирования μ в Jᵀ(JJᵀ + μ²E)⁻¹ (старое имя dls_lambda).
+    """
 
     def __init__(self, dh_params, dh_type="normal", analytical_inv=None,
                  plot_xlim=(-0.5, 0.5), plot_ylim=(-0.5, 0.5), plot_zlim=(0.0, 1.0),
                  ws_lim=None, ws_division=5,
-                 inv_m="jac_pinv", step_size=5e-1, max_iter=300, final_loss=1e-4, joint_types=None):
+                 inv_m="jac_pinv", step_size=1.0, max_iter=300, final_loss=1e-4, joint_types=None,
+                 tol_pos=None, tol_rot=None, line_search=True, dls_mu=0.1):
         dh_params = np.asarray(dh_params, dtype=float)
         # типы сочленений: 'R' — вращательное (переменная q_i = theta_i), 'P' — телескопическое (переменная d_i)
         self.joint_types = list(joint_types) if joint_types is not None else ['R'] * dh_params.shape[0]
@@ -259,8 +310,21 @@ class RobotSerial(Robot):
         self.step_size = step_size
         self.max_iter = max_iter
         self.final_loss = final_loss
-        self.dls_lambda = 0.1
+        self.tol_pos = tol_pos
+        self.tol_rot = tol_rot
+        self.line_search = line_search
+        self.dls_mu = dls_mu
         self.inv_history = []
+        self.inv_steps = []          # принятые длины шага α по итерациям (после backtracking)
+
+    # старое имя коэффициента демпфирования
+    @property
+    def dls_lambda(self):
+        return self.dls_mu
+
+    @dls_lambda.setter
+    def dls_lambda(self, value):
+        self.dls_mu = value
 
     @property
     def dh_params(self):
@@ -318,18 +382,20 @@ class RobotSerial(Robot):
         return jac
 
     def jacobian_book(self):
-        """Якобиан в порядке учебника: сначала ω, потом v."""
+        """Якобиан в порядке учебника и лекций: сначала ω, потом v."""
         J = self.jacobian
         return np.vstack([J[3:6], J[0:3]])
 
+    def jacobian_vw(self):
+        """То же, что свойство jacobian: порядок [v; ω] (Siciliano, Robotics Toolbox)."""
+        return self.jacobian
+
     def pose_error(self, end_frame):
-        """Невязка e = (Δp; δφ) между текущим положением схвата и целью (в базовой СК)."""
-        end = self.end_frame
-        dx = np.zeros([6, 1])
-        dx[0:3, 0] = (end_frame.t_3_1 - end.t_3_1).reshape(3)
-        diff = end.inv * end_frame
-        dx[3:6, 0] = end.r_3_3.dot(diff.r_3.reshape([3, 1])).reshape(3)
-        return dx
+        """Невязка e = (Δp; δφ) между текущим положением схвата и целью, в базовой СК.
+        Δp = p* − p; δφ = log(R*·Rᵀ)^∨ — вектор поворота, переводящего текущую ориентацию R
+        в заданную R* (точная формула для конечного поворота, см. функцию pose_error).
+        Порядок блоков [v; ω] — тот же, что у self.jacobian."""
+        return pose_error(self.end_frame, end_frame, order='vw').reshape(6, 1)
 
     def inverse(self, end_frame, q0=None):
         if self.analytical_inv is not None:
@@ -341,54 +407,137 @@ class RobotSerial(Robot):
         self.forward(theta_x)
         return theta_x
 
-    def inverse_numerical(self, end_frame, q0=None, method=None, step_size=None, max_iter=None, verbose=False):
-        """Итерационная ОЗК: q_{k+1} = q_k + α·M(q_k)·e_k, где M = J⁺, Jᵀ или демпфированная J⁺.
-        История норм невязки сохраняется в self.inv_history."""
+    def _wrap_angles(self):
+        for i, t in enumerate(self.joint_types):
+            if t == 'R':
+                self.axis_values[i] = simplify_angle(self.axis_values[i])
+
+    def inverse_numerical(self, end_frame, q0=None, method=None, step_size=None, max_iter=None, verbose=False,
+                          tol_pos=None, tol_rot=None, line_search=None, min_step=1e-6, max_rescue=3):
+        """Итерационная ОЗК: q_{k+1} = q_k + α_k·M(q_k)·e_k, где e = (Δp; δφ) — невязка pose_error,
+        M = J⁺ (метод Ньютона), Jᵀ (градиентный спуск) или Jᵀ(JJᵀ + μ²E)⁻¹ (демпфированный).
+
+        Шаг: α начинается с step_size (по умолчанию 1.0 — полный шаг Ньютона, квадратичная
+        сходимость вблизи решения). При line_search=True, если невязка ‖e‖ не уменьшилась,
+        шаг делится пополам (backtracking) вплоть до min_step. Если уменьшения нет и тогда
+        (обычно это окрестность особой конфигурации), делается полный шаг без проверки;
+        после max_rescue таких шагов подряд итерации прекращаются: цель недостижима или
+        процесс застрял. При неудаче возвращается лучшее найденное приближение.
+        Остановка по успеху: ‖Δp‖ < tol_pos (м) И ‖δφ‖ < tol_rot (рад); по умолчанию оба
+        допуска равны self.final_loss.
+
+        История норм ‖e‖ сохраняется в self.inv_history (первый элемент — невязка в q0, поэтому
+        число итераций равно len(inv_history) − 1), принятые шаги α — в self.inv_steps."""
         method = method or self.inv_m
-        step = self.step_size if step_size is None else step_size
+        alpha0 = self.step_size if step_size is None else step_size
         iters = self.max_iter if max_iter is None else max_iter
+        ls = self.line_search if line_search is None else line_search
+        tp = next(v for v in (tol_pos, self.tol_pos, self.final_loss) if v is not None)
+        tr = next(v for v in (tol_rot, self.tol_rot, self.final_loss) if v is not None)
         if q0 is not None:
             self.forward(q0)
-        self.inv_history = []
-        last_dx = np.zeros([6, 1])
+        self.inv_history, self.inv_steps = [], []
+        q = self.axis_values.copy()
+        dx = self.pose_error(end_frame)
+        f = float(np.linalg.norm(dx))
+        best = (f, q.copy(), dx)
+        rescues = 0
+        reason = 'исчерпано max_iter'
         for k in range(iters):
+            self.inv_history.append(f)
+            ep, er = np.linalg.norm(dx[0:3]), np.linalg.norm(dx[3:6])
+            if ep < tp and er < tr:
+                self._wrap_angles()
+                self.is_reachable_inverse = True
+                if verbose:
+                    print("итераций: %d, |dp| = %.2e м, |dphi| = %.2e рад, достижимо: True" % (k, ep, er))
+                return self.axis_values
             J = self.jacobian
             if method == "jac_t":
                 M = J.T
             elif method == "jac_dls":
-                M = J.T @ np.linalg.inv(J @ J.T + self.dls_lambda ** 2 * np.eye(6))
+                M = J.T @ np.linalg.inv(J @ J.T + self.dls_mu ** 2 * np.eye(6))
             else:
                 M = np.linalg.pinv(J)
-            dx = self.pose_error(end_frame)
-            self.inv_history.append(float(np.linalg.norm(dx)))
-            if np.linalg.norm(dx) < self.final_loss or np.linalg.norm(dx - last_dx) < 0.1 * self.final_loss:
-                for i, t in enumerate(self.joint_types):
-                    if t == 'R':
-                        self.axis_values[i] = simplify_angle(self.axis_values[i])
-                self.is_reachable_inverse = np.linalg.norm(dx) < self.final_loss
-                if verbose:
-                    print("итераций: %d, невязка %.2e, достижимо: %s" % (k + 1, np.linalg.norm(dx), self.is_reachable_inverse))
-                return self.axis_values
-            dq = step * M.dot(dx)
-            self.forward(self.axis_values + dq.reshape(self.num_axis))
-            last_dx = dx
-        logging.error("Pose cannot be reached!")
-        self.is_reachable_inverse = False
+            dq = M.dot(dx).reshape(self.num_axis)
+            alpha = alpha0
+            while True:
+                self.forward(q + alpha * dq)
+                dx_new = self.pose_error(end_frame)
+                f_new = float(np.linalg.norm(dx_new))
+                if not ls or f_new < (1.0 - 1e-4 * alpha) * f:
+                    break
+                alpha *= 0.5
+                if alpha < min_step:
+                    break
+            if ls and alpha < min_step:                     # ни один шаг не уменьшил невязку
+                if rescues >= max_rescue:
+                    reason = 'линейный поиск не уменьшил невязку'
+                    break
+                # «спасательный» полный шаг: позволяет уйти из окрестности особой конфигурации,
+                # где монотонный спуск застревает в локальном минимуме ‖e‖
+                rescues += 1
+                alpha = alpha0
+                self.forward(q + alpha * dq)
+                dx_new = self.pose_error(end_frame)
+                f_new = float(np.linalg.norm(dx_new))
+            else:
+                rescues = 0
+            converged = np.linalg.norm(dx_new[0:3]) < tp and np.linalg.norm(dx_new[3:6]) < tr
+            if not converged and np.linalg.norm(dx_new - dx) < 0.1 * min(tp, tr):   # невязка перестала меняться
+                q, dx, f = self.axis_values.copy(), dx_new, f_new
+                self.inv_steps.append(alpha)
+                self.inv_history.append(f)
+                reason = 'невязка перестала меняться'
+                break
+            q, dx, f = self.axis_values.copy(), dx_new, f_new
+            self.inv_steps.append(alpha)
+            if f < best[0]:
+                best = (f, q.copy(), dx)
+        else:
+            self.inv_history.append(f)
+            logging.error("Pose cannot be reached!")
+        if best[0] < f:                                     # неудача: вернуть лучшее найденное приближение
+            f, q, dx = best
+            self.inv_history.append(f)                      # последний элемент — невязка возвращённого q
+        self.forward(q)
+        self._wrap_angles()
+        ep, er = np.linalg.norm(dx[0:3]), np.linalg.norm(dx[3:6])
+        self.is_reachable_inverse = bool(ep < tp and er < tr)
+        if verbose:
+            print("итераций: %d, |dp| = %.2e м, |dphi| = %.2e рад, достижимо: %s (%s)"
+                  % (len(self.inv_history) - 1, ep, er, self.is_reachable_inverse, reason))
         return self.axis_values
 
-    def inverse_position(self, p_target, q0=None, step_size=0.5, max_iter=300, tol=1e-8):
-        """Итерационная ОЗК только по положению схвата: q ← q + α·J_v⁺·(p* − p). История — в inv_history."""
+    def inverse_position(self, p_target, q0=None, step_size=1.0, max_iter=300, tol=1e-8, line_search=True,
+                         min_step=1e-6):
+        """Итерационная ОЗК только по положению схвата: q ← q + α·J_v⁺·(p* − p).
+        α начинается с step_size (1.0 — шаг Ньютона) и при line_search=True делится пополам,
+        пока ‖p* − p‖ не уменьшится. История — в inv_history."""
         if q0 is not None:
             self.forward(q0)
         p_target = np.asarray(p_target, dtype=float).reshape(3)
         self.inv_history = []
+        e = p_target - self.end_frame.t_3_1.reshape(3)
         for _ in range(max_iter):
-            e = p_target - self.end_frame.t_3_1.reshape(3)
             self.inv_history.append(float(np.linalg.norm(e)))
             if np.linalg.norm(e) < tol:
                 break
-            dq = step_size * np.linalg.pinv(self.jacobian[0:3]) @ e
-            self.forward(self.axis_values + dq)
+            q = self.axis_values.copy()
+            dq = np.linalg.pinv(self.jacobian[0:3]) @ e
+            alpha = step_size
+            while True:
+                self.forward(q + alpha * dq)
+                e_new = p_target - self.end_frame.t_3_1.reshape(3)
+                if not line_search or np.linalg.norm(e_new) < (1.0 - 1e-4 * alpha) * np.linalg.norm(e):
+                    break
+                alpha *= 0.5
+                if alpha < min_step:
+                    break
+            if line_search and alpha < min_step:
+                self.forward(q)
+                break
+            e = e_new
         self.is_reachable_inverse = self.inv_history[-1] < max(tol, 1e-6)
         return self.axis_values
 
@@ -458,16 +607,22 @@ class RobotTrajectory(object):
         return self.len_segs_rot * self.rot_tran_ratio / 2. / np.pi + self.len_segs_tran
 
     def interpolate(self, num_segs, motion="p2p", method="linear"):
+        """Интерполяция между положениями self.frames.
+        motion='p2p' — линейно в пространстве сочленений между решениями ОЗК в узлах;
+        motion='lin' — прямая для положения схвата и геодезическая (SLERP) для ориентации:
+                       R(λ) = R_i·exp(λ·log(R_iᵀR_{i+1})), то есть поворот вокруг постоянной оси
+                       на угол, пропорциональный λ (лекция 4, § 4.6). ОЗК решается в каждой точке.
+        Возвращает значения обобщённых координат [num_segs+1, N] и «время» (длину пути)."""
         lengths = self.len_segs if self.time_points is None else self.time_points[1:] - self.time_points[:-1]
         length_total = np.sum(lengths)
         tra_array = np.zeros([len(self), max(self.robot.num_axis, 6)])
+        rots = [Rotation.from_matrix(f.r_3_3) for f in self.frames]
         for i in range(len(self)):
             if motion == "p2p":
                 self.robot.inverse(self.frames[i])
                 tra_array[i, 0:self.robot.num_axis] = self.robot.axis_values
             if motion == "lin":
                 tra_array[i, 0:3] = self.frames[i].t_3_1.reshape(3)
-                tra_array[i, 3:6] = self.frames[i].euler_3
         inter_values = np.zeros([num_segs + 1, self.robot.num_axis])
         inter_time = np.zeros([num_segs + 1])
         for progress in range(num_segs + 1):
@@ -483,8 +638,11 @@ class RobotTrajectory(object):
             if motion == "p2p":
                 inter_values[progress] = tra_array[index, 0:self.robot.num_axis] * (1 - p_temp) + tra_array[index + 1, 0:self.robot.num_axis] * p_temp
             if motion == "lin":
-                xyzabc = tra_array[index, 0:6] * (1 - p_temp) + tra_array[index + 1, 0:6] * p_temp
-                self.robot.inverse(Frame.from_euler_3(xyzabc[3:6], xyzabc[0:3].reshape([3, 1])))
+                p = tra_array[index, 0:3] * (1 - p_temp) + tra_array[index + 1, 0:3] * p_temp
+                r0 = rots[index]
+                rv = (r0.inv() * rots[index + 1]).as_rotvec()          # log(R_iᵀ R_{i+1})
+                R = (r0 * Rotation.from_rotvec(p_temp * rv)).as_matrix()
+                self.robot.inverse(Frame.from_r_3_3(R, p.reshape([3, 1])))
                 inter_values[progress] = self.robot.axis_values
             inter_time[progress] = np.sum(lengths[0:index]) + lengths[index] * p_temp
         return inter_values, inter_time
@@ -520,6 +678,38 @@ def vee(S):
     return np.array([S[2, 1] - S[1, 2], S[0, 2] - S[2, 0], S[1, 0] - S[0, 1]]) / 2.0
 
 
+def so3_exp(w):
+    """Экспонента: вектор поворота ω = θ·k -> матрица поворота (формула Родрига)."""
+    return Rotation.from_rotvec(np.asarray(w, dtype=float).reshape(3)).as_matrix()
+
+
+def so3_log(R):
+    """Логарифм: матрица поворота -> вектор поворота log(R)^∨ = θ·k, θ ∈ [0, π]."""
+    return Rotation.from_matrix(np.asarray(R, dtype=float)).as_rotvec()
+
+
+def _as_4x4(T):
+    return T.t_4_4 if isinstance(T, Frame) else np.asarray(T, dtype=float)
+
+
+def pose_error(T, T_des, order='vw'):
+    """Ошибка положения схвата T относительно заданного T_des (Frame или массив 4×4), в базовой СК.
+
+    Δp = p* − p,  δφ = log(R*·Rᵀ)^∨ — вектор поворота, который переводит текущую ориентацию R
+    в заданную R* (ось — орт k, длина — угол δ ∈ [0, π]). Формула точна для поворота любой величины;
+    малоугловая формула ½Σ x_i × x_i* даёт k·sin δ и при δ → π обращается в нуль.
+    order='vw' — вектор (Δp; δφ) (порядок RobotSerial.jacobian),
+    order='wv' — вектор (δφ; Δp) (порядок учебника и лекций). Возвращает массив формы (6,)."""
+    A, B = _as_4x4(T), _as_4x4(T_des)
+    dp = B[0:3, 3] - A[0:3, 3]
+    dphi = so3_log(B[0:3, 0:3] @ A[0:3, 0:3].T)
+    if order == 'vw':
+        return np.concatenate([dp, dphi])
+    if order == 'wv':
+        return np.concatenate([dphi, dp])
+    raise ValueError("order: 'vw' или 'wv'")
+
+
 def jacobian_numeric(robot, q, eps=1e-6):
     """Якобиан [v; ω] конечными разностями по прямой задаче — проверка формулы (3.62)."""
     q = np.asarray(q, dtype=float)
@@ -546,7 +736,10 @@ def fk2r(q, l=(1.0, 1.0)):
 
 
 def ik2r(x, y, l=(1.0, 1.0)):
-    """Плоский 2R: обе ветви (локоть вверх/вниз); пустой список, если цель недостижима (пример 2.10)."""
+    """Плоский 2R: обе ветви; пустой список, если цель недостижима (пример 2.10).
+    Порядок: сначала q₂ > 0, затем q₂ < 0. В осях курса (x вправо, y вверх) ветвь q₂ > 0 —
+    «локоть вниз» (локоть лежит справа от направления на схват, по ходу часовой стрелки),
+    q₂ < 0 — «локоть вверх»."""
     l1, l2 = l
     c2 = (x * x + y * y - l1 * l1 - l2 * l2) / (2 * l1 * l2)
     if abs(c2) > 1:
@@ -680,14 +873,93 @@ def manipulability(J):
     return np.sqrt(max(np.linalg.det(J @ J.T), 0.0))
 
 
-# ----- пример робота из ноутбука (6R, размеры типа UR10)
+# ============================================================== модели роботов
+# ----- «учебный 6R» из исходного ноутбука ПЗК_и_ОЗК_на_Python.ipynb.
+# Таблица НЕ совпадает ни с одной моделью Universal Robots (раньше называлась «размеры типа UR10»);
+# оставлена, чтобы не менять уже существующие примеры. Для реального робота — make_ur5e().
 UR_DH = np.array([[0.163, 0., 0.5 * pi, 0.],
                   [0., 0.632, pi, 0.5 * pi],
                   [0., 0.6005, pi, 0.],
                   [0.2013, 0., -0.5 * pi, -0.5 * pi],
                   [0.1025, 0., 0.5 * pi, 0.],
                   [0.094, 0., 0., 0.]])
+TRAINING_6R_DH = UR_DH
 
 
 def make_ur():
+    """«Учебный 6R» (таблица UR_DH): шестизвенник с параллельными осями 2–4, без сферической кисти.
+    Это не модель реального робота; сквозной пример курса — make_ur5e()."""
     return RobotSerial(UR_DH, plot_xlim=(-1.3, 1.3), plot_ylim=(-1.3, 1.3), plot_zlim=(-0.6, 1.5))
+
+
+# ----- UR5e (Universal Robots, серия e)
+# Источник: Universal Robots, статья «DH Parameters for calculations of kinematics and dynamics»,
+# https://www.universal-robots.com/articles/ur/application-installation/dh-parameters-for-calculations-of-kinematics-and-dynamics/
+# (таблица UR5e/UR7e; номинальные значения — у конкретного робота контроллер хранит поправки калибровки).
+# Строки | d | a | alpha | theta0 |, классические параметры ДХ, метры и радианы.
+UR5E_DH = np.array([[0.1625, 0., 0.5 * pi, 0.],
+                    [0., -0.425, 0., 0.],
+                    [0., -0.3922, 0., 0.],
+                    [0.1333, 0., 0.5 * pi, 0.],
+                    [0.0997, 0., -0.5 * pi, 0.],
+                    [0.0996, 0., 0., 0.]])
+# Паспорт UR5e (datasheet Universal Robots): диапазон каждого сочленения ±360°, скорость ±180°/с,
+# досягаемость 850 мм.
+UR5E_QLIM = np.radians([[-360., 360.]] * 6)
+UR5E_QD_MAX = np.radians([180.] * 6)
+UR5E_REACH = 0.850
+
+
+def make_ur5e():
+    """UR5e по официальной таблице ДХ Universal Robots (см. UR5E_DH и ссылку над ней).
+
+    Особенности, которые видны прямо из таблицы: оси 2, 3, 4 параллельны (α₂ = α₃ = 0), поэтому
+    кисть НЕсферическая — центра запястья нет, и развязки «положение — ориентация» как у PUMA тоже нет;
+    a₂, a₃ отрицательны — так выбраны направления осей xᵢ (при q = 0 рука вытянута вдоль −x₀).
+    Пределы и скорости из паспорта записаны в атрибуты qlim и qd_max (рад, рад/с), досягаемость — reach (м).
+    Порядок блоков якобиана, как и у всех моделей kinlib, — [v; ω]."""
+    r = RobotSerial(UR5E_DH, plot_xlim=(-0.9, 0.9), plot_ylim=(-0.9, 0.9), plot_zlim=(-0.4, 1.1))
+    r.qlim, r.qd_max, r.reach, r.name = UR5E_QLIM.copy(), UR5E_QD_MAX.copy(), UR5E_REACH, 'UR5e'
+    return r
+
+
+# ----- PUMA 560 (Unimation)
+# Параметры и знаки α — как в Robotics Toolbox for Python (roboticstoolbox.models.DH.Puma560, версия 1.1.1):
+# d₁ = 26,45 дюйма = 0,67183 м (от монтажной плоскости до оси плеча), a₂ = 0,4318, a₃ = 0,0203,
+# d₃ = 0,15005, d₄ = 0,4318 м; α = (90°, 0, −90°, 90°, −90°, 0); пределы сочленений тоже оттуда.
+PUMA560_DH = np.array([[26.45 * 0.0254, 0., 0.5 * pi, 0.],
+                       [0., 0.4318, 0., 0.],
+                       [0.15005, 0.0203, -0.5 * pi, 0.],
+                       [0.4318, 0., 0.5 * pi, 0.],
+                       [0., 0., -0.5 * pi, 0.],
+                       [0., 0., 0., 0.]])
+PUMA560_QLIM = np.radians([[-160., 160.], [-110., 110.], [-135., 135.], [-266., 266.], [-100., 100.], [-266., 266.]])
+
+
+def make_puma(convention='rtb', d6=0.0):
+    """PUMA 560 — пример учебника (лекции 1–3).
+
+    convention='rtb'  — таблица Robotics Toolbox (PUMA560_DH): прямая задача совпадает с
+                        roboticstoolbox.models.DH.Puma560().fkine(q) до ошибок округления;
+    convention='book' — расстановка осей примера 2.4 лекции 2: α = (−90°, 0, 90°, −90°, 90°, 0),
+                        смещение плеча d₂ = 0,15005 м во второй строке, d₁ = 0 (начало — на оси плеча).
+    Смещение 0,15005 м в строке 2 или 3 даёт одну и ту же прямую задачу: оси z₁ и z₂ параллельны
+    (α₂ = 0), и сдвиг вдоль них перестановочен с поворотом θ₂. Таблицы 'rtb' и 'book' различаются
+    выбором направлений осей, поэтому одни и те же числа q дают в них разные позы.
+    d6 — вылет инструмента от центра запястья (в обеих таблицах по умолчанию 0)."""
+    if convention == 'rtb':
+        dh = PUMA560_DH.copy()
+    elif convention == 'book':
+        dh = np.array([[0., 0., -0.5 * pi, 0.],
+                       [0.15005, 0.4318, 0., 0.],
+                       [0., 0.0203, 0.5 * pi, 0.],
+                       [0.4318, 0., -0.5 * pi, 0.],
+                       [0., 0., 0.5 * pi, 0.],
+                       [0., 0., 0., 0.]])
+    else:
+        raise ValueError("convention: 'rtb' или 'book'")
+    dh[5, 0] = d6
+    zlim = (-0.3, 1.5) if convention == 'rtb' else (-0.9, 0.9)
+    r = RobotSerial(dh, plot_xlim=(-0.9, 0.9), plot_ylim=(-0.9, 0.9), plot_zlim=zlim)
+    r.qlim, r.name = PUMA560_QLIM.copy(), 'PUMA 560'
+    return r
